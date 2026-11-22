@@ -46,6 +46,76 @@ pending_homework = {}
 # Ожидающие выбора предмета для команды /dz.
 pending_dz_selections = {}
 
+# Ожидающие сообщения для команды /q: (chat_id, user_id) -> ID сообщений.
+pending_q_messages = {}
+
+
+async def finish_q_attempt(message: Message, success: bool):
+    """Завершает попытку /q и удаляет четыре сообщения."""
+    if not message.from_user:
+        return False
+
+    key = (message.chat.id, message.from_user.id)
+    pending = pending_q_messages.pop(key, None)
+
+    if not pending:
+        return False
+
+    sent_successfully = False
+
+    if success:
+        try:
+            if SOURCE_GROUP_ID == 0:
+                raise ValueError("Не указан SOURCE_GROUP_ID")
+
+            # Копируем исходное сообщение (текст, фото или файл)
+            # в первую группу, откуда оно передаётся в MAX.
+            await message.bot.copy_message(
+                chat_id=SOURCE_GROUP_ID,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            sent_successfully = True
+        except Exception as error:
+            print(f"Не удалось передать сообщение в MAX: {error}")
+
+    if not success:
+        status_text = "Попытка отправки сообщения в MAX прервана ❌"
+    elif sent_successfully:
+        status_text = "Попытка отправки сообщения в MAX успешна ✅"
+    else:
+        status_text = "Не удалось отправить сообщение в MAX ❌"
+
+    status = await message.answer(status_text)
+
+    # Даём пользователю время увидеть результат, затем удаляем всю цепочку.
+    await asyncio.sleep(2)
+
+    message_ids = [
+        pending["command_message_id"],
+        pending["prompt_message_id"],
+        message.message_id,
+        status.message_id,
+    ]
+
+    results = await asyncio.gather(
+        *[
+            message.bot.delete_message(
+                chat_id=message.chat.id,
+                message_id=message_id,
+            )
+            for message_id in message_ids
+            if message_id is not None
+        ],
+        return_exceptions=True,
+    )
+
+    for result in results:
+        if isinstance(result, Exception):
+            print(f"Не удалось удалить сообщение из попытки /q: {result}")
+
+    return True
+
 
 
 HOMEWORK_COMMANDS = {
@@ -63,21 +133,23 @@ HOMEWORK_COMMANDS = {
     "veroyatnost_baza": "вероятность",
     "informatika_baza": "информатика",
     "angliyskiy_profil": "иностранный язык",
-    "new": "узнать изменения последнего обновления",
-    "q": "/q текст (сообщение в MAX)",
+    "new": "узнать информацию о последнем обновлении",
+    "q": "отправить фото/текст/файл в MAX",
+    "qq": "Отмена отправки в MAX",
     "ras": "отправить последнее расписание",
 }
 
 NEW_MESSAGE = (
-    "Обновление Бота до версии 2.1!\n\n"
+    "Обновление Бота до версии 2.2!\n\n"
     "<b>⭐ Нововведения!</b>\n"
     "<blockquote>"
-    "1. Добавлена возможность вызова последнего расписания.\n"
-    "2. Добавлена возможность перессылки сообщения в MAX."
+    "1. Добавлена возможность отправлять фото/файл в МАХ.\n"
+    "2. Слегка изменен дизайн указания дз."
     "</blockquote>\n\n"
     "<b>🛠️ Исправления!</b>\n"
     "<blockquote>"
-    "1. Проблем не было обнаружено."
+    "1. При отправке объявления в расписании бот указывал на него дз.\n"
+    "2. При объявлении в расписании бот приписывает его к уроку"
     "</blockquote>"
 )
 
@@ -159,15 +231,6 @@ SUBJECTS = {
     ],
     "география": ["география", "географии"],
 }
-
-NO_HOMEWORK = [
-    "нет",
-    "физкультура",
-    "индивидуальный проект",
-    "основы безопасности и защиты Родины",
-    "в мире профессий",
-    "педкласс",
-]
 
 # Если в расписании предмет указан без уточнения,
 # проверяем ДЗ сразу для базы и профиля.
@@ -273,7 +336,7 @@ async def send_homework_by_subject(message: Message, subject_name: str):
 
             output.append(
 
-                f"📝 <b>{html.escape(display_name)}:</b>\n"
+                f"<b>{html.escape(display_name)}:</b>\n"
 
                 f"<blockquote>{html.escape(task)}</blockquote>"
 
@@ -281,7 +344,8 @@ async def send_homework_by_subject(message: Message, subject_name: str):
 
         else:
             output.append(
-                f"📝 <b>{html.escape(display_name)}:</b> не нашел:("
+                f"<b>{html.escape(display_name)}:</b>\n"
+                f"<blockquote>не нашел:(</blockquote>"
             )
 
     # Отправляем текстовый результат, только если он есть.
@@ -575,18 +639,19 @@ def find_subject_match(line):
 
 def subject_from_name(name):
     cleaned = re.sub(r"[/,:;.!]+$", "", name.strip()).strip()
-    normalized = re.sub(r"[\s,]+", " ", cleaned.lower()).strip()
+    normalized = re.sub(r"[\s,]+", " ", cleaned.casefold()).strip()
     for subject, aliases in SUBJECTS.items():
         candidates = [subject] + aliases
         for candidate in candidates:
             candidate_normalized = re.sub(
-                r"[\s,]+", " ", candidate.lower()
+                r"[\s,]+", " ", candidate.casefold()
             ).strip()
             if normalized == candidate_normalized:
                 return subject
-    subject, match = find_subject_match(cleaned)
-    if match and match.start() == 0 and match.end() == len(cleaned):
-        return subject
+    # Не используем find_subject_match для определения точного названия:
+    # эта функция ищет предмет внутри строки и может принять
+    # «Геометрия» за начало «Геометрия база» или «Геометрия профиль».
+    # Точные варианты уже проверены выше.
     return None
 
 
@@ -794,7 +859,7 @@ def parse_schedule(text):
         # Если заголовок и первый урок находятся на одной строке,
         # переносим номер урока на новую строку.
         inline_header = re.match(
-            r"^(.*?\bрасписание\b.*?)(?=\s+\d+[.)]\s*)",
+            r"^(.*?\bрасписание\b.*?)(?=\s+\d+(?:\s*,\s*\d+)*(?:[.)]\s*|\s+урок(?:и|а)?\s+))",
             lines[0],
             flags=re.IGNORECASE,
         )
@@ -807,7 +872,7 @@ def parse_schedule(text):
 
     normalized_text = "\n".join(lines)
     nonempty = [line.strip() for line in normalized_text.splitlines() if line.strip()]
-    if nonempty and not re.match(r"^\d+[.)]\s*", nonempty[0]):
+    if nonempty and not re.match(r"^\d+(?:\s*,\s*\d+)*(?:[.)]\s*|\s+урок(?:и|а)?\s+)", nonempty[0], re.IGNORECASE):
         title = nonempty[0]
 
     for raw_line in normalized_text.splitlines():
@@ -815,7 +880,7 @@ def parse_schedule(text):
         if not line:
             continue
 
-        numbered = re.match(r"^(\d+)[.)]\s*(.*)$", line)
+        numbered = re.match(r"^(\d+(?:\s*,\s*\d+)*)(?:[.)]\s*|\s+урок(?:и|а)?\s+)(.*)$", line, re.IGNORECASE)
         if numbered:
             current = {
                 "number": numbered.group(1),
@@ -1031,41 +1096,48 @@ async def receive_schedule_or_homework(message: Message):
                     )
             return
 
-        title, lessons = parse_schedule(message.text)
-        if not lessons:
-            return
 
         if TARGET_GROUP_ID == 0:
             print("Не указан TARGET_GROUP_ID в .env")
             return
 
+        # Разбираем расписание только для поиска предметов и ДЗ.
+        title, lessons = parse_schedule(message.text)
 
-        output = [f"📚 <b>{html.escape(title)}</b>"]
+        # Убираем имя автора из исходного сообщения.
+        original_lines = message.text.splitlines()
+
+        if original_lines:
+            original_lines[0] = re.sub(
+                r"^\s*Анна Ефремова\s*:\s*",
+                "",
+                original_lines[0],
+                count=1,
+                flags=re.IGNORECASE,
+            )
+
+        # Берём всё содержимое после заголовка как есть.
+        schedule_body = "\n".join(original_lines[1:]).strip("\n")
+
+        # Формируем только заголовок, остальной текст не перестраиваем.
+        output = [
+            f"<b>📚 {html.escape(title)}</b>"
+        ]
+
+        if schedule_body:
+            output.append(html.escape(schedule_body))
+
         photo_replies = []
         homework_output = []
         seen_homework = set()
 
+        # Ищем ДЗ по распознанным предметам.
         for lesson in lessons:
             subjects = lesson["subjects"]
 
-            if not subjects:
-                continue
-
-            # Сначала выводим только список уроков.
-            lesson_subjects = " / ".join(
-                item["display"] for item in subjects
-            )
-
-            output.append(
-                f"<b>{lesson['number']}.</b> "
-                f"{html.escape(lesson_subjects)}"
-            )
-
-            # Затем отдельно собираем домашние задания.
             for item in subjects:
                 display_name = item["display"]
 
-                # Убираем пометку Педкласс для проверки предмета.
                 clean_display = re.sub(
                     r"\s*/\s*педкласс$",
                     "",
@@ -1073,18 +1145,20 @@ async def receive_schedule_or_homework(message: Message):
                     flags=re.IGNORECASE,
                 ).strip()
 
-                normalized = clean_display.casefold().strip(" .,:;")
+                normalized = re.sub(
+                    r"[\s,]+", " ", clean_display.casefold()
+                ).strip(" .,:;")
 
-                if normalized in {
-                    subject.casefold() for subject in NO_HOMEWORK
-                }:
+                # Неизвестные объявления не считаем предметами.
+                if (
+                    not item["canonical"]
+                    and normalized not in SHARED_SUBJECTS
+                ):
                     continue
 
                 homework_subjects = get_schedule_homework_subjects(item)
 
                 for canonical, homework_display in homework_subjects:
-
-                    # Не выводим один предмет повторно.
                     key = canonical or homework_display.casefold()
 
                     if key in seen_homework:
@@ -1099,13 +1173,13 @@ async def receive_schedule_or_homework(message: Message):
                         photo = None
                         task = None
 
-                    # Убираем запятые и пометку Педкласс из названия ДЗ.
                     homework_name = re.sub(
                         r"\s*/\s*педкласс$",
                         "",
                         homework_display,
                         flags=re.IGNORECASE,
                     )
+
                     homework_name = re.sub(
                         r"\s*,\s*",
                         " ",
@@ -1119,24 +1193,19 @@ async def receive_schedule_or_homework(message: Message):
                         )
                         photo_replies.append((homework_name, photo))
 
-
                     elif task:
-
                         homework_output.append(
-
                             f"<b>{html.escape(homework_name)}:</b>\n"
-
                             f"<blockquote>{html.escape(task)}</blockquote>"
-
                         )
 
                     else:
                         homework_output.append(
-                            f"<b>{html.escape(homework_name)}:</b> "
-                            "не нашел:("
+                            f"<b>{html.escape(homework_name)}:</b>\n"
+                            f"<blockquote>не нашел:(</blockquote>"
                         )
 
-        # Добавляем отдельный блок домашних заданий.
+        # Добавляем блок ДЗ после исходного расписания.
         output.append("")
         output.append("<b>📝 ДЗ:</b>")
 
@@ -1144,7 +1213,6 @@ async def receive_schedule_or_homework(message: Message):
             output.extend(homework_output)
         else:
             output.append("Домашних заданий нет.")
-
 
         schedule_text = "\n".join(output)
 
@@ -1154,12 +1222,13 @@ async def receive_schedule_or_homework(message: Message):
             parse_mode="HTML",
         )
 
-        # Запоминаем расписание, которое только что опубликовали.
+        # Сохраняем готовое сообщение для команды /ras.
         save_last_schedule(schedule_text)
 
-        # После основного расписания отвечаем на каждое исходное фото-сообщение.
+        # Отвечаем на исходные фотографии с ДЗ.
         for display_name, photo in photo_replies:
             _file_id, source_chat_id, source_message_id = photo
+
             try:
                 await message.bot.send_message(
                     chat_id=source_chat_id,
@@ -1177,9 +1246,11 @@ async def receive_schedule_or_homework(message: Message):
 
         print(
             f"Расписание из группы {SOURCE_GROUP_ID} опубликовано "
-            f"в группе {TARGET_GROUP_ID}. ID сообщения: {schedule_message.message_id}"
+            f"в группе {TARGET_GROUP_ID}. "
+            f"ID сообщения: {schedule_message.message_id}"
         )
         return
+
 
     # Вторая группа: сообщения с ДЗ. Бот здесь ничего не отвечает,
     # пока не публикует готовое расписание по сообщению из первой группы.
@@ -1187,52 +1258,59 @@ async def receive_schedule_or_homework(message: Message):
         if message.from_user and message.from_user.is_bot:
             return
 
+        # Пока пользователь ожидает отправки, /qq отменяет её,
+        # а любое другое текстовое сообщение считается содержимым для MAX.
+        if message.from_user:
+            q_key = (message.chat.id, message.from_user.id)
+            command_text = message.text.strip().split()[0].split("@")[0]
+
+            if command_text == "/qq":
+                if await finish_q_attempt(message, success=False):
+                    return
+                return
+
+            if q_key in pending_q_messages:
+                await finish_q_attempt(message, success=True)
+                return
 
         # Обработка команд получения ДЗ.
         if message.text.startswith("/"):
             command = message.text.split()[0]
             command = command.split("@")[0].lstrip("/")
 
-            # Команда /q — передать сообщение в первую группу.
+            # Команда /q — начать отправку сообщения в MAX.
             if command == "q":
-                parts = message.text.split(maxsplit=1)
-
-                if len(parts) < 2 or not parts[1].strip():
-                    await message.answer(
-                        "Напиши сообщение после команды.\n"
-                        "Например: /q Сидоров сдал"
-                    )
+                if not message.from_user:
                     return
 
-                text_to_send = parts[1].strip()
+                key = (message.chat.id, message.from_user.id)
+
+                # Если у пользователя уже есть активная попытка, не создаём вторую.
+                if key in pending_q_messages:
+                    await message.answer(
+                        "У тебя уже есть активная попытка. "
+                        "Отправь сообщение или /qq для отмены."
+                    )
+                    return
 
                 if SOURCE_GROUP_ID == 0:
-                    await message.answer(
-                        "Не указана первая группа."
-                    )
+                    await message.answer("Не указана первая группа.")
                     return
 
-                # Отправляем текст в первую группу.
-                await message.bot.send_message(
-                    chat_id=SOURCE_GROUP_ID,
-                    text=text_to_send,
+                username = (
+                    f"@{message.from_user.username}"
+                    if message.from_user.username
+                    else message.from_user.full_name
                 )
 
-                # Показываем подтверждение во второй группе.
-                confirmation = await message.answer(
-                    "Передал сообщение ✅"
+                prompt = await message.answer(
+                    f"{username}, жду сообщение/фото/файл."
                 )
 
-                # Через 2 секунды удаляем подтверждение.
-                await asyncio.sleep(2)
-
-                try:
-                    await confirmation.delete()
-                except Exception as error:
-                    print(
-                        f"Не удалось удалить подтверждение /q: {error}"
-                    )
-
+                pending_q_messages[key] = {
+                    "command_message_id": message.message_id,
+                    "prompt_message_id": prompt.message_id,
+                }
                 return
 
             # Команда /ras — повторно отправить последнее расписание.
@@ -1312,6 +1390,10 @@ async def collect_photo_homework(message: Message):
     if message.from_user and message.from_user.is_bot:
         return
 
+    # Если пользователь ожидает отправки через /q, фото завершает попытку.
+    if await finish_q_attempt(message, success=True):
+        return
+
     caption = message.caption or ""
     subjects = subjects_in_text(caption)
 
@@ -1335,6 +1417,21 @@ async def collect_photo_homework(message: Message):
             )
         )
 
+
+
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}),
+    F.document,
+)
+async def collect_q_document(message: Message):
+    """Принимает файл как содержимое активной попытки /q."""
+    if message.chat.id != TARGET_GROUP_ID:
+        return
+
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    await finish_q_attempt(message, success=True)
 
 
 async def main():
